@@ -83,17 +83,120 @@ intervals and snapshot frequency are configurable—see the
 
 ## Restoring a database
 
-To restore a database, Litestream fetches the latest snapshot at or before the
-requested point in time and then applies each subsequent LTX file in TXID order
-to bring the database up to that point. Because TXIDs form a contiguous
-sequence, Litestream can verify that no transactions are missing before
-restoring—any gap in the sequence would otherwise result in a corrupted
+To restore a database, Litestream fetches the most recent snapshot that does not
+overshoot the requested restore point and then applies each subsequent LTX file
+in TXID order to bring the database up to that point. Because TXIDs form a
+contiguous sequence, Litestream can verify that no transactions are missing
+before restoring—any gap in the sequence would otherwise result in a corrupted
 database file.
+
+The two restore targets use different boundary comparisons. A `-txid` target is
+inclusive: a file is eligible when its maximum TXID is less than or equal to the
+requested TXID. A `-timestamp` target is exclusive: a file is eligible only when
+it was created strictly before the requested timestamp, so a file whose creation
+time exactly equals the timestamp is skipped.
 
 Earlier v0.3.x releases tracked replication state using randomly-generated
 "generation" IDs and a directory of shadow WAL files. Litestream v0.5 replaces
 both concepts with TXID-based LTX files. See the
 [Migration Guide](/docs/migration) if you are upgrading from v0.3.x.
+
+
+## Restore granularity
+
+Litestream replays whole LTX files and never applies part of one, so your restore
+points are the boundaries of the files that still exist in the replica. A file is
+eligible for a restore plan only if its entire TXID range fits within the target;
+a file that would overshoot is skipped rather than partially applied. If skipping
+it leaves the plan short of the requested TXID, the restore fails with `no
+matching backup files available` even though the transaction itself was
+replicated.
+
+Restore granularity is therefore coarser than the write rate, and it coarsens
+further over time as retention prunes the files that held the finer endpoints.
+
+**While L0 files are retained**, restore endpoints are the boundaries of each L0
+file. Under continuous writes that is roughly one endpoint per sync interval. An
+idle period produces no file at all, and a single catch-up sync after a burst can
+emit several.
+
+**After L0 expiry**, the finest surviving endpoints are L1 file boundaries. L0
+files are removed once they have been compacted into L1 _and_ have outlived
+[`l0-retention`](/reference/config#l0-retention) (default `5m`), so a restore
+point that was available a few minutes ago can become permanently unreachable.
+Compacting L1 into L2 writes the larger file but leaves the source files in
+place, so L1 boundaries stay restorable until retention removes them.
+
+**At the snapshot cutoff**, retention enforcement derives a single minimum
+snapshot TXID from `snapshot.retention` and applies that same cutoff to every
+configured compaction level in one pass, skipping L0, which has its own
+`l0-retention` schedule. L1, L2, and L3 do not age out independently by level;
+older history is pruned across all of them together.
+
+### Choosing a restore point
+
+Use the [`ltx` command](/reference/ltx) to see which endpoints exist before
+planning a restore:
+
+```
+$ litestream ltx -level all /var/lib/db
+level  min_txid          max_txid          size  created
+0      000000000000000d  000000000000000d  310   2026-07-28T14:27:18Z
+1      0000000000000001  0000000000000001  639   2026-07-28T14:26:48Z
+1      0000000000000002  0000000000000003  224   2026-07-28T14:26:58Z
+1      0000000000000004  0000000000000005  240   2026-07-28T14:27:02Z
+1      0000000000000006  0000000000000008  266   2026-07-28T14:27:08Z
+1      0000000000000009  000000000000000b  289   2026-07-28T14:27:14Z
+1      000000000000000c  000000000000000d  310   2026-07-28T14:27:18Z
+9      0000000000000001  0000000000000001  639   2026-07-28T14:26:48Z
+```
+
+The snapshot covers TXID 1 and the L1 files chain contiguously from there, so
+every `max_txid` above is reachable: `0000000000000001`, `0000000000000003`,
+`0000000000000005`, `0000000000000008`, `000000000000000b`, and
+`000000000000000d`. Every other TXID in the range fails because those
+transactions survive only inside a larger L1 file that cannot be partially
+applied. A `max_txid` on its own is not a guarantee. `ltx` reports what is
+stored, not what can be replayed, so a listed endpoint still fails if retention
+has removed the snapshot beneath it or broken the chain leading to it.
+
+You can also preview a plan without writing files using
+[`restore -dry-run`](/reference/restore#dry-run), which shows the snapshot and
+the contiguous run of LTX files that would be replayed:
+
+```
+$ litestream restore -dry-run -txid 0000000000000008 -o /tmp/r.db /var/lib/db
+Restore plan:
+  source: /var/lib/db
+  target: /tmp/r.db
+  replica: file
+  txid range: 0000000000000001 - 0000000000000008
+
+Files to fetch:
+level  file                                   min_txid          max_txid          size  timestamp
+9      0000000000000001-0000000000000001.ltx  0000000000000001  0000000000000001  639   2026-07-28T14:26:48Z
+1      0000000000000002-0000000000000003.ltx  0000000000000002  0000000000000003  224   2026-07-28T14:26:58Z
+1      0000000000000004-0000000000000005.ltx  0000000000000004  0000000000000005  240   2026-07-28T14:27:02Z
+1      0000000000000006-0000000000000008.ltx  0000000000000006  0000000000000008  266   2026-07-28T14:27:08Z
+```
+
+### Keeping granularity longer
+
+Two settings widen the window in which fine-grained restore points remain
+available:
+
+- Increase [`l0-retention`](/reference/config#l0-retention) to keep per-sync
+  endpoints around longer. There is no way to retain L0 indefinitely, since
+  `l0-retention: 0` is rejected by config validation, so pick a duration that
+  covers the period you care about. `8760h` is one year.
+- Set [`retention.enabled: false`](/reference/config#retention) to stop
+  Litestream from deleting anything in remote storage. Local files are still
+  cleaned up, but remote granularity does not degrade at all unless a provider
+  lifecycle policy removes the files.
+
+Both settings trade storage cost for finer restore points. See
+[Cost Considerations](/reference/config#cost-considerations) before raising them
+on a busy database.
 
 
 ## Retention

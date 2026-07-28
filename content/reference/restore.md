@@ -104,6 +104,56 @@ litestream restore [arguments] REPLICA_URL
 ```
 
 
+## Restore granularity
+
+Litestream replays whole LTX files, so `-txid` and `-timestamp` can only land on
+the boundaries of files that still exist in the replica. A file whose range would
+overshoot the target is skipped entirely rather than partially applied, so not
+every replicated transaction is a valid restore point.
+
+Run [`litestream ltx -level all`](/reference/ltx) to list the files currently
+available. A TXID that is no file's `max_txid` is never a valid `-txid` target,
+but the reverse does not hold. `ltx` lists what is stored without checking that a
+restore plan can be built, so a listed `max_txid` still fails if no retained
+snapshot sits at or below it, or if a gap breaks the chain leading to it. Confirm
+a candidate with [`restore -dry-run`](#dry-run) before relying on it.
+
+```
+$ litestream ltx -level all /var/lib/db
+level  min_txid          max_txid          size  created
+0      000000000000000d  000000000000000d  310   2026-07-28T14:27:18Z
+1      0000000000000001  0000000000000001  639   2026-07-28T14:26:48Z
+1      0000000000000002  0000000000000003  224   2026-07-28T14:26:58Z
+1      0000000000000004  0000000000000005  240   2026-07-28T14:27:02Z
+1      0000000000000006  0000000000000008  266   2026-07-28T14:27:08Z
+1      0000000000000009  000000000000000b  289   2026-07-28T14:27:14Z
+1      000000000000000c  000000000000000d  310   2026-07-28T14:27:18Z
+9      0000000000000001  0000000000000001  639   2026-07-28T14:26:48Z
+
+$ litestream restore -txid 0000000000000005 -o /tmp/r5.db /var/lib/db   # succeeds
+
+$ litestream restore -txid 0000000000000004 -o /tmp/r4.db /var/lib/db
+Error: no matching backup files available
+```
+
+Each restore needs its own output path. Litestream refuses to write over an
+existing non-empty file, and that check runs before the restore plan is
+evaluated, so reusing one path reports `cannot restore, output path already
+exists and is not empty` instead of the granularity error above.
+
+{{< alert icon="⚠️" text="The <code>no matching backup files available</code> error does not distinguish between a transaction that was never replicated and one that exists but is only reachable at a coarser granularity. Check the <code>ltx</code> listing before concluding that data is missing." >}}
+
+Granularity is finest while L0 files are retained—roughly one endpoint per sync
+interval—and coarsens to L1 boundaries once L0 files expire. See
+[Restore granularity](/how-it-works#restore-granularity) for the full model and
+the settings that keep fine-grained endpoints available longer.
+
+Boundary comparisons differ between the two flags. `-txid` is inclusive: a file
+is eligible when its maximum TXID is at or below the requested TXID.
+`-timestamp` is exclusive: a file must have been created strictly before the
+requested timestamp, so a file created at exactly that instant is skipped.
+
+
 ## Conditional Restore Behavior
 
 ### Using -if-replica-exists
