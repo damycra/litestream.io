@@ -145,6 +145,47 @@ dbs:
 See the [Configuration Reference](/reference/config/#minio-configuration) for
 detailed MinIO setup instructions.
 
+### Garage
+
+[Garage](https://garagehq.deuxfleurs.fr/) is a lightweight, self-hosted, distributed
+S3-compatible object store designed for small clusters (including single-node "clusters"
+in a home lab). Like MinIO, it's a common choice when you want to keep replicas off any
+third-party cloud.
+
+**Configuration:**
+
+```yaml
+dbs:
+  - path: /path/to/db
+    replica:
+      type: s3
+      bucket: mybucket
+      path: db
+      endpoint: http://garage.example.com:3900
+      region: garage
+      access-key-id: ${GARAGE_ACCESS_KEY}
+      secret-access-key: ${GARAGE_SECRET_KEY}
+```
+
+**Notes:**
+
+- Create the bucket and an access key with `garage bucket create` / `garage key new` /
+  `garage bucket allow`; Garage doesn't provision either automatically
+- The `region` field is required by the S3 client even though Garage mostly ignores it —
+  it must match the `s3_region` set in the node's `garage.toml`
+- Garage's default listen port is `3900`
+- Garage implements a subset of the S3 API; multipart upload and basic object operations
+  work, but check the [Garage compatibility notes](https://garagehq.deuxfleurs.fr/documentation/reference-manual/s3-compatibility/)
+  before relying on less common operations
+
+**Restoring on a fresh host:** if your entrypoint runs `litestream restore -if-replica-exists`
+against a **replica URL** (rather than `-config`) before starting `replicate` — the pattern
+this site recommends for containers — put the endpoint in that URL, not only in
+`litestream.yml`. See
+[Restore ignores the config file's endpoint](#restore-ignores-the-config-files-endpoint)
+below; it's easy to hit with any self-hosted endpoint, and Garage's `host:port` URLs are
+exactly the shape that's affected.
+
 ### Backblaze B2
 
 [Backblaze B2](https://www.backblaze.com/cloud-storage) offers affordable cloud
@@ -627,6 +668,55 @@ See the [Configuration Reference](/reference/config/#s3-replica) for all
 available S3 replica options.
 
 ## Troubleshooting
+
+### Restore ignores the config file's endpoint
+
+**Symptom:** `replicate` works fine against your custom endpoint — objects show up in
+MinIO/Garage/etc. — but `litestream restore <replica URL>` fails, and the error mentions
+**AWS**, even though your config only has a custom `endpoint:` and never AWS:
+
+```
+ERROR failed to run error="... s3: cannot lookup bucket region: operation error S3:
+GetBucketLocation, https response error StatusCode: 403, RequestID: ...,
+... api error InvalidAccessKeyId: The AWS Access Key Id you provided does not exist in
+our records."
+```
+
+An AWS request ID in a stack that has no AWS in it is the tell. Worse, if your AWS
+credentials also happen to be valid for a bucket of that name (real AWS credentials are
+often present in the same environment), the request can *succeed* against AWS and find
+nothing, and `-if-replica-exists` turns that into a silent, exit-0 "no matching backups
+found" — the caller then initializes an empty database, as if this were a genuine first
+boot.
+
+**Why this happens:** `litestream restore` accepts *either* a replica URL *or* a `-config`
+path, never both. Given a bare URL, restore builds its S3 client from the URL alone — no
+`-config` file is read at all, so anything set only in `litestream.yml` (`endpoint:`,
+`region:`, `force-path-style:`, …) is invisible to it. `replicate -config litestream.yml`
+does read the config file and does see your `endpoint:`, which is why replication looks
+fine while restore doesn't — the two commands are not consulting the same settings.
+
+This most often bites the container-entrypoint pattern recommended elsewhere in these
+docs — `restore -if-replica-exists` at boot (by URL, since the database doesn't exist yet
+so it can't be looked up by `path:` in the config), then `replicate -config` afterward.
+
+**Solutions:**
+
+1. Put the endpoint in the restore URL itself, not only in the config file. Either form
+   works:
+
+   ```sh
+   # Host form (MinIO/Garage-style bucket.host:port)
+   litestream restore -o /data/db.sqlite3 s3://mybucket.garage.example.com:3900/db/db.sqlite3
+
+   # Query form -- keeps the scheme, and is unambiguous if you're
+   # constructing the URL by appending a path/filename to it
+   litestream restore -o /data/db.sqlite3 's3://mybucket/db/db.sqlite3?endpoint=http://garage.example.com:3900'
+   ```
+
+2. Don't rely on `-if-replica-exists` masking this as "nothing to restore" — check restore
+   logs on first boot in a new environment to confirm the request actually reached your
+   endpoint and not AWS.
 
 ### Authentication Errors
 
