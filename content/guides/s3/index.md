@@ -109,7 +109,7 @@ following command.
 litestream restore -o my.db s3://BUCKETNAME/PATHNAME
 ```
 
-{{< alert icon="⚠️" text="The command line URL variant only supports AWS S3 and a limited set of S3-compatible providers that can be auto-detected from the URL hostname. For other S3-compatible services like MinIO or self-hosted solutions, you must use a configuration file with the `endpoint` parameter. See [Custom Endpoints](#custom-endpoints-s3-compatible-services) below." >}}
+{{< alert icon="⚠️" text="`litestream restore <replica URL>` reads settings from that URL only — it never reads your configuration file, even if one exists at the default path. For self-hosted endpoints (MinIO, Garage, etc.) that aren't auto-detected from a plain bucket URL, put the endpoint directly in the restore URL rather than relying on a config file's `endpoint:` setting. See [Custom Endpoints](#custom-endpoints-s3-compatible-services) below." >}}
 
 ### Configuration file usage
 
@@ -459,44 +459,65 @@ for additional policy insights.
 
 ## Custom Endpoints (S3-Compatible Services)
 
-Litestream supports S3-compatible storage services such as MinIO, Backblaze B2,
-DigitalOcean Spaces, and others. However, how you configure these services
-depends on whether Litestream can auto-detect the endpoint from the URL.
+Litestream supports S3-compatible storage services such as MinIO, Garage, Backblaze B2,
+DigitalOcean Spaces, and others via the `endpoint` configuration option. How you supply
+that endpoint depends on **which command you're running**, not just which provider you're
+using.
 
-### Auto-Detected Providers
+### `replicate -config` reads the config file; `restore <replica URL>` does not
 
-When using the command line URL variant (`s3://BUCKET/PATH`), Litestream can
-automatically detect the correct endpoint for these providers based on the URL
-hostname pattern:
-
-- **AWS S3**: Standard `s3://bucket/path` URLs
-- **Backblaze B2**: URLs containing `.backblazeb2.com`
-- **DigitalOcean Spaces**: URLs containing `.digitaloceanspaces.com`
-- **Scaleway**: URLs containing `.scw.cloud`
-
-For these providers, you can use both command line and configuration file approaches.
-
-### Services Requiring Configuration Files
-
-For S3-compatible services that cannot be auto-detected from the URL hostname,
-you **must** use a configuration file with the `endpoint` parameter. This includes:
-
-- MinIO (self-hosted or remote)
-- Self-hosted S3-compatible storage
-- Other S3-compatible providers not in the auto-detected list
-
-Attempting to use the command line URL variant with these services will result
-in Litestream connecting to AWS S3 instead of your intended endpoint, causing
-authentication errors like:
+`litestream replicate -config litestream.yml` merges settings from the config file and the
+replica URL, so an `endpoint:` set in the config file is honored. `litestream restore
+<replica URL>`, given a bare URL instead of `-config`, builds its S3 client from that URL
+**alone** — it does not read the config file at all, even if one exists at the default
+path. An `endpoint:` set only in `litestream.yml` is therefore invisible to `restore
+<replica URL>`, and the request goes to AWS S3 using the URL's host as a literal bucket
+name, typically failing with:
 
 ```text
 cannot lookup bucket region: InvalidAccessKeyId: The AWS Access Key Id you
 provided does not exist in our records.
 ```
 
-### MinIO Example
+(or, worse, succeeding silently against AWS if real AWS credentials also happen to be
+present in the environment — see
+[Troubleshooting](/guides/s3-compatible/#restore-ignores-the-config-files-endpoint) in the
+S3-Compatible Services guide for that failure mode.)
 
-For MinIO, always use a configuration file:
+If you always restore using `-config` and a database path instead of a URL
+(`litestream restore -config litestream.yml /path/to/db`), the config file's `endpoint:` is
+used normally — but that only works once the database's `path:` is already registered in
+the config file, which isn't the case for a fresh restore onto a host where the database
+doesn't exist yet (the common container-entrypoint pattern: restore on boot, then
+replicate).
+
+### Auto-Detected Providers
+
+Litestream can determine the correct endpoint from the URL hostname alone, with no config
+file needed by either command, for:
+
+- **AWS S3**: Standard `s3://bucket/path` URLs
+- **Backblaze B2**: URLs containing `.backblazeb2.com`
+- **DigitalOcean Spaces**: URLs containing `.digitaloceanspaces.com`
+- **Scaleway**: URLs containing `.scw.cloud`
+- **MinIO-style self-hosted endpoints**: `s3://bucket.host:port/path` — this covers MinIO,
+  Garage, and most other self-hosted S3-compatible servers reachable on a non-standard port.
+  See [S3-Compatible Services](/guides/s3-compatible) for the full, regularly-updated list.
+
+### Everything Else: Put the Endpoint in the URL
+
+For anything that doesn't match one of the patterns above — most commonly, a self-hosted
+endpoint on its own real domain, like `minio.example.com` — the endpoint needs to be
+spelled out. For `replicate -config`, that's the config file's `endpoint:` field, as usual.
+For `restore <replica URL>`, add it to the URL itself with the `?endpoint=` query
+parameter, which also preserves the scheme (`https://` works, unlike the host form above,
+which always assumes plain `http://`):
+
+```sh
+litestream restore -o /path/to/db 's3://mybucket/db/mydb.sqlite3?endpoint=https://minio.example.com:9000'
+```
+
+### MinIO / Garage Example
 
 ```yaml
 dbs:
@@ -511,9 +532,15 @@ dbs:
       secret-access-key: ${MINIO_SECRET_KEY}
 ```
 
-For detailed MinIO configuration options, see the
-[MinIO Configuration](/reference/config#minio-configuration) section in the
-configuration reference.
+This is read correctly by `replicate -config`. If the same deployment also restores by URL
+— for example, a container entrypoint that restores before the database file exists — use
+the `?endpoint=` URL form above for that command instead of relying on this file's
+`endpoint:` value, which restore-by-URL never sees.
+
+For detailed MinIO and Garage configuration, see
+[S3-Compatible Services](/guides/s3-compatible) and the
+[MinIO Configuration](/reference/config#minio-configuration) section in the configuration
+reference.
 
 
 ## See Also
